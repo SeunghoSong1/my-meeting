@@ -57,7 +57,7 @@
     <div id="root"></div>
 
     <script type="text/babel" data-type="module">
-        import React, { useState, useEffect, useRef } from 'react';
+        import React, { useState, useEffect, useRef, useCallback } from 'react';
         import ReactDOM from 'react-dom/client';
 
         function App() {
@@ -67,6 +67,7 @@
             const [status, setStatus] = useState('Initializing...');
             const [showSettings, setShowSettings] = useState(false);
             const [showSummary, setShowSummary] = useState(false);
+            const [debugInfo, setDebugInfo] = useState({ local: 'Inactive', remote: 'Inactive' });
             
             const [localStream, setLocalStream] = useState(null);
             const [remoteStream, setRemoteStream] = useState(null);
@@ -84,6 +85,7 @@
 
             const localVideoRef = useRef(null);
             const remoteVideoRef = useRef(null);
+            const previewVideoRef = useRef(null);
             const peerRef = useRef(null);
             const connRef = useRef(null);
             const callRef = useRef(null);
@@ -99,17 +101,37 @@
                 if (savedTurn) setTurnConfig(JSON.parse(savedTurn));
             }, []);
 
+            // Cleanup logic
+            const stopEverything = () => {
+                if (localStream) {
+                    localStream.getTracks().forEach(track => {
+                        track.stop();
+                        track.enabled = false;
+                    });
+                }
+                if (peerRef.current) {
+                    peerRef.current.destroy();
+                }
+                console.log("Cleanup complete");
+            };
+
+            useEffect(() => {
+                const handleBeforeUnload = () => stopEverything();
+                window.addEventListener('beforeunload', handleBeforeUnload);
+                return () => {
+                    window.removeEventListener('beforeunload', handleBeforeUnload);
+                    stopEverything();
+                };
+            }, [localStream]);
+
             const saveSettings = (e) => {
                 e.preventDefault();
                 const formData = new FormData(e.target);
-                
-                // Gemini Key
                 const key = formData.get('apiKey');
                 localStorage.setItem('gemini_api_key', key);
                 setGeminiKey(key);
                 geminiKeyRef.current = key;
 
-                // TURN Config
                 const turnData = {
                     url: formData.get('turnUrl'),
                     username: formData.get('turnUser'),
@@ -119,7 +141,7 @@
                 setTurnConfig(turnData);
 
                 setShowSettings(false);
-                alert("설정이 저장되었습니다. 적용을 위해 페이지를 새로고침합니다.");
+                alert("설정이 저장되었습니다.");
                 window.location.reload();
             };
 
@@ -160,19 +182,13 @@
                 setIsSummarizing(false);
             };
 
-            // --- 2. PeerJS Setup (Enhanced ICE) ---
+            // --- 2. PeerJS Setup ---
             useEffect(() => {
-                // 기본 공용 STUN 서버 목록 (대폭 강화)
                 let iceServers = [
                     { urls: 'stun:stun.l.google.com:19302' },
                     { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' },
-                    { urls: 'stun:stun3.l.google.com:19302' },
-                    { urls: 'stun:stun4.l.google.com:19302' },
                     { urls: 'stun:global.stun.twilio.com:3478' }
                 ];
-
-                // 사용자가 TURN 서버를 입력했으면 추가 (보안망 우회용)
                 if (turnConfig.url) {
                     iceServers.unshift({
                         urls: turnConfig.url,
@@ -189,10 +205,8 @@
                 peer.on('open', (id) => { setMyId(id); setStatus('Ready'); });
                 peer.on('error', (err) => {
                     console.error("Peer Error:", err);
-                    let msg = "연결 오류";
-                    if(err.type === 'peer-unavailable') msg = "상대방을 찾을 수 없습니다.";
-                    if(err.type === 'network' || err.type === 'server-error') msg = "방화벽에 의해 차단됨 (TURN 설정 필요)";
-                    setStatus(msg); alert(msg);
+                    setStatus("Error: " + err.type); 
+                    if(err.type === 'peer-unavailable') alert("상대방 ID를 찾을 수 없습니다.");
                 });
 
                 peer.on('connection', (conn) => {
@@ -204,9 +218,12 @@
                     setStatus('Incoming Call...');
                     navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then((stream) => {
                         setLocalStream(stream);
+                        setDebugInfo(prev => ({ ...prev, local: 'Active' }));
+                        
                         call.answer(stream);
                         call.on('stream', (remoteStream) => {
                             setRemoteStream(remoteStream);
+                            setDebugInfo(prev => ({ ...prev, remote: 'Active' }));
                             setMode('call');
                             setStatus('Connected');
                         });
@@ -242,10 +259,15 @@
 
                 navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then((stream) => {
                     setLocalStream(stream);
+                    setDebugInfo(prev => ({ ...prev, local: 'Active' }));
                     setMode('call');
                     
                     const call = peerRef.current.call(targetId, stream);
-                    call.on('stream', (rs) => { setRemoteStream(rs); setStatus('Connected'); });
+                    call.on('stream', (rs) => { 
+                        setRemoteStream(rs); 
+                        setDebugInfo(prev => ({ ...prev, remote: 'Active' }));
+                        setStatus('Connected'); 
+                    });
                     call.on('error', (e) => setStatus("Call Error: " + e));
                     callRef.current = call;
                     setupSpeechRecognition();
@@ -283,17 +305,64 @@
                 window.speechSynthesis.speak(u);
             };
 
-            const hangUp = () => window.location.reload();
+            const hangUp = () => { 
+                stopEverything();
+                window.location.reload(); 
+            };
+
+            const refreshVideo = () => {
+                if (localStream && localVideoRef.current) {
+                    localVideoRef.current.srcObject = localStream;
+                    localVideoRef.current.play().catch(e => { if(e.name !== 'AbortError') console.log("Local Play Error:", e); });
+                }
+                if (remoteStream && remoteVideoRef.current) {
+                    remoteVideoRef.current.srcObject = remoteStream;
+                    remoteVideoRef.current.play().catch(e => { if(e.name !== 'AbortError') console.log("Remote Play Error:", e); });
+                }
+                console.log("Forced video refresh");
+            };
+
+            const testCamera = async () => {
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    setLocalStream(null);
+                }
+
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    setLocalStream(stream); 
+                    setDebugInfo(prev => ({ ...prev, local: 'Preview Active' }));
+                } catch (e) {
+                    alert("카메라를 켤 수 없습니다: " + e.message);
+                }
+            };
+
+            const stopCamera = () => {
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    setLocalStream(null);
+                    setDebugInfo(prev => ({ ...prev, local: 'Stopped' }));
+                }
+            };
+
+            // [수정] 미리보기 비디오 자동재생 로직 (안정적인 useEffect 사용)
+            useEffect(() => {
+                if (mode === 'welcome' && localStream && previewVideoRef.current) {
+                    const videoEl = previewVideoRef.current;
+                    videoEl.srcObject = localStream;
+                    const playPromise = videoEl.play();
+                    
+                    if (playPromise !== undefined) {
+                        playPromise.catch(e => {
+                            // AbortError(사용자 중단) 등은 무시하여 로그를 깨끗하게 유지
+                            if (e.name !== 'AbortError') console.error("Preview Play Failed:", e.message);
+                        });
+                    }
+                }
+            }, [localStream, mode]);
 
             useEffect(() => {
-                if (localStream && localVideoRef.current && localVideoRef.current.srcObject !== localStream) {
-                    localVideoRef.current.srcObject = localStream;
-                    localVideoRef.current.play().catch(console.error);
-                }
-                if (remoteStream && remoteVideoRef.current && remoteVideoRef.current.srcObject !== remoteStream) {
-                    remoteVideoRef.current.srcObject = remoteStream;
-                    remoteVideoRef.current.play().catch(console.error);
-                }
+                refreshVideo();
             }, [localStream, remoteStream, mode]);
 
             // --- Render ---
@@ -312,30 +381,43 @@
                                 <p className="text-xs text-blue-500 mt-2 font-mono bg-blue-50 py-1 px-2 rounded inline-block">Status: {status}</p>
                             </div>
 
+                            <div className="mb-6">
+                                {localStream ? (
+                                    <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden mb-2">
+                                        {/* [수정] onPreviewVideoMount 대신 previewVideoRef 사용 */}
+                                        <video ref={previewVideoRef} autoPlay playsInline muted className="w-full h-full object-cover transform scale-x-[-1]" />
+                                        <div className="absolute bottom-2 left-2 bg-green-500 text-white text-[10px] px-2 py-1 rounded">카메라 정상 작동 중</div>
+                                        <button onClick={stopCamera} className="absolute top-2 right-2 bg-red-500/80 hover:bg-red-600 text-white text-xs px-2 py-1 rounded shadow transition">
+                                            <i className="fas fa-power-off"></i> 끄기
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <button onClick={testCamera} className="w-full py-3 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold border border-slate-300 mb-2 transition">
+                                        📸 카메라 테스트 (미리보기)
+                                    </button>
+                                )}
+                            </div>
+
                             {/* Settings Modal */}
                             {showSettings && (
                                 <div className="absolute inset-0 bg-white/95 backdrop-blur-md rounded-3xl z-50 flex flex-col items-center justify-center p-6 animate-fade-in overflow-y-auto">
                                     <h3 className="text-lg font-bold mb-4 w-full">⚙️ 상세 설정</h3>
                                     <form onSubmit={saveSettings} className="w-full space-y-4">
                                         <div>
-                                            <label className="block text-xs font-bold text-slate-500 mb-1">Gemini API Key (AI 번역)</label>
+                                            <label className="block text-xs font-bold text-slate-500 mb-1">Gemini API Key</label>
                                             <input name="apiKey" defaultValue={geminiKey} placeholder="AIzaSy..." className="w-full p-2 border rounded-lg bg-slate-50 text-sm" />
                                         </div>
                                         <div className="border-t pt-4">
-                                            <label className="block text-xs font-bold text-slate-500 mb-1 flex items-center gap-2">
-                                                TURN Server (보안망 우회용)
-                                                <span className="text-[10px] bg-red-100 text-red-500 px-1 rounded">필수 아님</span>
-                                            </label>
-                                            <p className="text-[10px] text-slate-400 mb-2">화면이 검게 나온다면 <a href="https://www.metered.ca/tools/openrelay/" target="_blank" className="text-blue-500 underline">OpenRelay</a> 등에서 무료 계정을 받아 입력하세요.</p>
-                                            <input name="turnUrl" defaultValue={turnConfig.url} placeholder="turn:global.turn.twilio.com:3478" className="w-full p-2 border rounded-lg bg-slate-50 text-sm mb-2" />
+                                            <label className="block text-xs font-bold text-slate-500 mb-1">TURN Server (영상 안 나올 때)</label>
+                                            <input name="turnUrl" defaultValue={turnConfig.url} placeholder="turn:..." className="w-full p-2 border rounded-lg bg-slate-50 text-sm mb-2" />
                                             <div className="flex gap-2">
-                                                <input name="turnUser" defaultValue={turnConfig.username} placeholder="Username" className="w-1/2 p-2 border rounded-lg bg-slate-50 text-sm" />
-                                                <input name="turnPass" defaultValue={turnConfig.credential} placeholder="Password" className="w-1/2 p-2 border rounded-lg bg-slate-50 text-sm" />
+                                                <input name="turnUser" defaultValue={turnConfig.username} placeholder="User" className="w-1/2 p-2 border rounded-lg bg-slate-50 text-sm" />
+                                                <input name="turnPass" defaultValue={turnConfig.credential} placeholder="Pass" className="w-1/2 p-2 border rounded-lg bg-slate-50 text-sm" />
                                             </div>
                                         </div>
                                         <div className="flex gap-2 mt-4">
                                             <button type="button" onClick={() => setShowSettings(false)} className="flex-1 py-2 bg-slate-200 text-slate-700 rounded-lg text-sm">취소</button>
-                                            <button type="submit" className="flex-1 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold">저장 및 재시작</button>
+                                            <button type="submit" className="flex-1 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold">저장</button>
                                         </div>
                                     </form>
                                 </div>
@@ -371,15 +453,35 @@
 
             return (
                 <div className="relative h-full w-full bg-slate-900 overflow-hidden">
+                    {/* Remote Video */}
                     <div className="absolute inset-0 flex items-center justify-center bg-black">
+                        <div className="absolute top-4 left-4 z-40 bg-black/50 text-[10px] text-white p-2 rounded pointer-events-none">
+                            <p>Status: {status}</p>
+                            <p>Local Video: {debugInfo.local}</p>
+                            <p>Remote Video: {debugInfo.remote}</p>
+                        </div>
+
                         {remoteStream ? (
-                            <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
+                            <video 
+                                ref={remoteVideoRef} 
+                                autoPlay 
+                                playsInline 
+                                className="w-full h-full object-cover"
+                                onLoadedMetadata={(e) => e.target.play()} 
+                            />
                         ) : (
                             <div className="text-center animate-pulse text-white/50">
                                 <div className="text-4xl mb-2"><i className="fas fa-spinner fa-spin"></i></div>
-                                <p>연결 중... (검은 화면이면 TURN 설정 필요)</p>
+                                <p>연결 중... (목소리가 들리면 비디오 새로고침을 눌러보세요)</p>
                             </div>
                         )}
+                        
+                        <button 
+                            onClick={refreshVideo} 
+                            className="absolute top-20 left-1/2 transform -translate-x-1/2 bg-white/10 hover:bg-white/20 backdrop-blur px-4 py-2 rounded-full text-xs text-white/70 hover:text-white border border-white/10 transition z-30 flex items-center gap-2"
+                        >
+                            <i className="fas fa-sync-alt"></i> 비디오가 안 보이나요? (새로고침)
+                        </button>
                     </div>
 
                     <div className="absolute bottom-32 left-0 right-0 px-6 flex flex-col items-center pointer-events-none z-10">
@@ -394,7 +496,15 @@
                     </div>
 
                     <div className="absolute top-6 right-6 w-48 aspect-[4/3] bg-black rounded-2xl overflow-hidden shadow-2xl border border-white/20 z-20">
-                        <video ref={localVideoRef} autoPlay playsInline muted className={`w-full h-full object-cover transform scale-x-[-1] ${isVideoOff ? 'hidden' : ''}`} />
+                        <video 
+                            ref={localVideoRef} 
+                            autoPlay 
+                            playsInline 
+                            muted 
+                            className={`w-full h-full object-cover transform scale-x-[-1] ${isVideoOff ? 'hidden' : ''}`} 
+                            onLoadedMetadata={(e) => e.target.play()}
+                        />
+                        {isVideoOff && <div className="w-full h-full flex items-center justify-center bg-slate-800"><i className="fas fa-video-slash text-white/30 text-2xl"></i></div>}
                     </div>
 
                     <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 z-20">
