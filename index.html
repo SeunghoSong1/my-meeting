@@ -68,13 +68,16 @@
             const [isServerConnected, setIsServerConnected] = useState(false); 
             const [showSettings, setShowSettings] = useState(false);
             const [showSummary, setShowSummary] = useState(false);
-            const [retryCount, setRetryCount] = useState(0); // [추가] 재접속 카운터
-            
+            const [retryCount, setRetryCount] = useState(0); 
+            const [isVideoLoading, setIsVideoLoading] = useState(true);
+
+            // [수정] 상세 진단 정보 상태 (ICE 상태 추가)
             const [mediaStatus, setMediaStatus] = useState({
                 localVideo: '없음',
                 localAudio: '없음',
                 remoteVideo: '대기중',
-                remoteAudio: '대기중'
+                remoteAudio: '대기중',
+                iceStatus: '대기중 (New)' // ICE 연결 상태
             });
             const [showDiagnostics, setShowDiagnostics] = useState(false);
 
@@ -110,12 +113,13 @@
                 if (savedTurn) setTurnConfig(JSON.parse(savedTurn));
             }, []);
 
-            // 미디어 트랙 상태 모니터링
+            // [수정] 미디어 트랙 및 ICE 상태 모니터링
             useEffect(() => {
                 const checkInterval = setInterval(() => {
                     const status = {
                         localVideo: '없음', localAudio: '없음',
-                        remoteVideo: '대기중', remoteAudio: '대기중'
+                        remoteVideo: '대기중', remoteAudio: '대기중',
+                        iceStatus: mediaStatus.iceStatus // 기존 값 유지
                     };
 
                     if (localStream) {
@@ -130,10 +134,19 @@
                         const aTrack = remoteStream.getAudioTracks()[0];
                         status.remoteVideo = vTrack ? (vTrack.enabled && vTrack.readyState === 'live' ? '수신중 (Live)' : `비정상 (${vTrack.readyState})`) : '트랙 없음';
                         status.remoteAudio = aTrack ? (aTrack.enabled ? '수신중' : '상대방이 끔') : '트랙 없음';
+                        
+                        if (vTrack && vTrack.readyState === 'live' && !vTrack.muted) {
+                            setIsVideoLoading(false);
+                        }
+                    }
+                    
+                    // ICE 상태 업데이트 (WebRTC 내부 상태)
+                    if (callRef.current && callRef.current.peerConnection) {
+                        status.iceStatus = callRef.current.peerConnection.iceConnectionState;
                     }
 
                     setMediaStatus(status);
-                }, 2000);
+                }, 1000);
 
                 return () => clearInterval(checkInterval);
             }, [localStream, remoteStream]);
@@ -252,14 +265,12 @@
                 
                 peer.on('error', (err) => {
                     console.error("Peer Error:", err);
-                    
                     if(err.type === 'peer-unavailable') {
                         setStatus("오류: 상대방 ID 없음");
-                        alert("❌ 상대방 ID를 찾을 수 없습니다.\n\n1. 코드를 정확히 복사했는지 확인하세요. (공백 주의)\n2. 상대방이 아직 '준비됨' 상태가 아닐 수 있습니다.\n3. 상대방에게 '재접속' 버튼을 누르라고 요청해보세요.");
-                    } else if(err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed') {
-                        setStatus("오류: 연결 끊김");
+                        alert("❌ 상대방 ID를 찾을 수 없습니다.");
+                    } else if(err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+                        setStatus("오류: 네트워크 차단됨");
                         setIsServerConnected(false);
-                        // alert("⚠️ 서버 연결이 끊어졌습니다. '재접속' 버튼을 눌러주세요.");
                     } else {
                         setStatus("오류: " + err.type);
                     }
@@ -275,10 +286,22 @@
                     navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then((stream) => {
                         setLocalStream(stream);
                         call.answer(stream);
+                        
+                        // [추가] ICE 상태 감지 리스너
+                        call.peerConnection.oniceconnectionstatechange = () => {
+                            const state = call.peerConnection.iceConnectionState;
+                            console.log("ICE State:", state);
+                            setMediaStatus(prev => ({...prev, iceStatus: state}));
+                            if (state === 'failed' || state === 'disconnected') {
+                                alert("⚠️ 연결이 방화벽에 의해 차단되었습니다 (ICE Failed).\n모바일 핫스팟이나 TURN 서버 설정을 사용하세요.");
+                            }
+                        };
+
                         call.on('stream', (remoteStream) => {
                             setRemoteStream(remoteStream);
                             setMode('call');
                             setStatus('연결됨 (Connected)');
+                            setIsVideoLoading(true);
                         });
                         callRef.current = call;
                         setupSpeechRecognition();
@@ -293,11 +316,10 @@
                 peerRef.current = peer;
             };
 
-            // Init on load
             useEffect(() => {
                 initPeer();
                 return () => { if(peerRef.current) peerRef.current.destroy(); };
-            }, [turnConfig, retryCount]); // retryCount가 바뀌면 재시작
+            }, [turnConfig, retryCount]); 
 
             const setupDataConnection = (conn) => {
                 conn.on('data', async (data) => {
@@ -311,14 +333,13 @@
             };
 
             const connectToPeer = () => {
-                // [수정] 입력값 공백 제거 (Trim)
                 const safeTargetId = targetId.trim();
                 
                 if (!safeTargetId) return alert("ID를 입력하세요.");
                 if (safeTargetId === myId) return alert("자기 자신에게는 연결할 수 없습니다.");
                 
                 if (!isServerConnected) {
-                    return alert("⚠️ 내 컴퓨터가 아직 서버에 연결되지 않았습니다.\n상단의 '재접속' 버튼을 눌러주세요.");
+                    return alert("⚠️ 서버에 연결되지 않았습니다. '재접속' 버튼을 눌러주세요.");
                 }
 
                 setStatus('연결 시도 중...');
@@ -334,9 +355,20 @@
                     setMode('call');
                     
                     const call = peerRef.current.call(safeTargetId, stream);
+                    
+                    // [추가] ICE 상태 감지 리스너 (발신자용)
+                    call.peerConnection.oniceconnectionstatechange = () => {
+                        const state = call.peerConnection.iceConnectionState;
+                        setMediaStatus(prev => ({...prev, iceStatus: state}));
+                        if (state === 'failed' || state === 'disconnected') {
+                            alert("⚠️ 연결이 방화벽에 의해 차단되었습니다 (ICE Failed).\n모바일 핫스팟이나 TURN 서버 설정을 사용하세요.");
+                        }
+                    };
+
                     call.on('stream', (rs) => { 
                         setRemoteStream(rs); 
-                        setStatus('연결됨 (Connected)'); 
+                        setStatus('연결됨 (Connected)');
+                        setIsVideoLoading(true);
                     });
                     call.on('error', (e) => setStatus("Call Error: " + e));
                     callRef.current = call;
@@ -386,7 +418,7 @@
                 if (playPromise !== undefined) {
                     playPromise.catch(error => {
                         if (error.name === 'AbortError' || error.message.includes('interrupted') || error.message.includes('removed')) {
-                            // Ignore harmless errors
+                            // Ignore
                         } else {
                             console.error('Playback Error:', error);
                         }
@@ -426,7 +458,6 @@
                 }
             };
 
-            // [추가] 수동 재접속 함수
             const manualReconnect = () => {
                 setStatus("서버 재접속 중...");
                 setRetryCount(prev => prev + 1);
@@ -457,7 +488,6 @@
                                 <div className="w-16 h-16 bg-gradient-to-tr from-blue-500 to-purple-600 rounded-2xl mx-auto flex items-center justify-center text-white text-2xl shadow-lg mb-4"><i className="fas fa-bolt"></i></div>
                                 <h1 className="text-2xl font-bold text-slate-900">GlobalMeet AI</h1>
                                 
-                                {/* Status Indicator with Reconnect Button */}
                                 <div className="flex flex-col items-center gap-2 mt-2">
                                     {geminiKey && (
                                         <span className="text-[10px] text-green-600 bg-green-50 px-2 py-1 rounded-full border border-green-100 flex items-center gap-1">
@@ -552,7 +582,7 @@
                     {/* Remote Video */}
                     <div className="absolute inset-0 flex items-center justify-center bg-black">
                         
-                        {/* [추가] 진단 패널 */}
+                        {/* [추가] 진단 패널 (수정: ICE 상태 표시) */}
                         <div className="absolute top-4 left-4 z-40 flex flex-col gap-2 pointer-events-auto">
                             <button 
                                 onClick={() => setShowDiagnostics(!showDiagnostics)} 
@@ -564,17 +594,16 @@
                             {showDiagnostics && (
                                 <div className="bg-black/80 p-3 rounded-lg text-[10px] text-white backdrop-blur-md border border-white/10 w-48 space-y-2">
                                     <div>
-                                        <p className="font-bold text-blue-300">내 상태 (Local)</p>
-                                        <p>비디오: <span className={mediaStatus.localVideo.includes('정상') ? 'text-green-400' : 'text-red-400'}>{mediaStatus.localVideo}</span></p>
-                                        <p>오디오: <span className={mediaStatus.localAudio.includes('정상') ? 'text-green-400' : 'text-red-400'}>{mediaStatus.localAudio}</span></p>
+                                        <p className="font-bold text-blue-300">네트워크 상태 (ICE)</p>
+                                        <p className={mediaStatus.iceStatus === 'connected' ? 'text-green-400 font-bold' : (mediaStatus.iceStatus === 'failed' ? 'text-red-500 font-bold' : 'text-yellow-400')}>{mediaStatus.iceStatus || '대기중'}</p>
+                                    </div>
+                                    <div className="border-t border-white/20 pt-2">
+                                        <p className="font-bold text-purple-300">내 상태 (Local)</p>
+                                        <p>비디오: {mediaStatus.localVideo}</p>
                                     </div>
                                     <div className="border-t border-white/20 pt-2">
                                         <p className="font-bold text-purple-300">상대방 상태 (Remote)</p>
-                                        <p>비디오: <span className={mediaStatus.remoteVideo.includes('수신중') ? 'text-green-400' : 'text-red-400'}>{mediaStatus.remoteVideo}</span></p>
-                                        <p>오디오: <span className={mediaStatus.remoteAudio.includes('수신중') ? 'text-green-400' : 'text-red-400'}>{mediaStatus.remoteAudio}</span></p>
-                                    </div>
-                                    <div className="border-t border-white/20 pt-2 text-xs text-slate-400">
-                                        <p>연결 상태: {status}</p>
+                                        <p>비디오: {mediaStatus.remoteVideo}</p>
                                     </div>
                                 </div>
                             )}
@@ -589,17 +618,23 @@
                                 onLoadedMetadata={(e) => safePlay(e.target)} 
                             />
                         ) : (
-                            <div className="text-center animate-pulse text-white/50">
-                                <div className="text-4xl mb-2"><i className="fas fa-spinner fa-spin"></i></div>
-                                <p>연결 중... (목소리가 들리면 비디오 새로고침을 눌러보세요)</p>
+                            <div className="text-center animate-pulse text-white/50 flex flex-col items-center">
+                                <div className="text-4xl mb-3"><i className="fas fa-spinner fa-spin"></i></div>
+                                <p className="text-lg font-bold mb-1">
+                                    {isVideoLoading ? "영상 수신 대기 중..." : "연결 중..."}
+                                </p>
+                                <p className="text-xs text-slate-400 max-w-xs">
+                                    상대방 카메라 신호를 기다리고 있습니다.<br/>
+                                    (화면이 계속 안 나오면 아래 버튼을 눌러보세요)
+                                </p>
                             </div>
                         )}
                         
                         <button 
                             onClick={refreshVideo} 
-                            className="absolute top-20 left-1/2 transform -translate-x-1/2 bg-white/10 hover:bg-white/20 backdrop-blur px-4 py-2 rounded-full text-xs text-white/70 hover:text-white border border-white/10 transition z-30 flex items-center gap-2"
+                            className="absolute top-1/2 left-1/2 transform -translate-x-1/2 translate-y-16 bg-white/10 hover:bg-white/20 backdrop-blur px-5 py-2 rounded-full text-xs text-white border border-white/20 transition z-30 flex items-center gap-2 shadow-lg"
                         >
-                            <i className="fas fa-sync-alt"></i> 비디오가 안 보이나요? (새로고침)
+                            <i className="fas fa-sync-alt"></i> 영상 재연결 (강제 새로고침)
                         </button>
                     </div>
 
